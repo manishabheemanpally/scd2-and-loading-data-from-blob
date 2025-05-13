@@ -1,0 +1,86 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, row_number, desc, expr, lit
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+import pyspark.sql.functions as F
+from pyspark.sql.types import IntegerType, BooleanType
+
+# Setup
+spark = SparkSession.builder.appName("SCDType2").getOrCreate()
+
+# Define keys and load timestamp column
+primary_keys = ['item', 'loc']
+load_datetime_col = 'LoadDateTime'
+
+# Load source data
+df_source = spark.read.format("delta").table("temp")
+
+# Identify comparison columns
+all_columns = df_source.columns
+compare_columns = [c for c in all_columns if c not in primary_keys + [load_datetime_col]]
+
+# Deduplicate source on latest LoadDateTime
+window_spec = Window.partitionBy(*primary_keys).orderBy(desc(load_datetime_col))
+df_source_latest = (
+    df_source
+    .withColumn("row_num", row_number().over(window_spec))
+    .filter("row_num = 1")
+    .drop("row_num")
+)
+
+# Load ACTIVE and ISDELETED target rows
+delta_table_path = "abfss://fb7d5e34-3f5a-4b4b-be88-18515c08e08b@onelake.dfs.fabric.microsoft.com/1fdefdf8-4c58-47f1-9ad9-9b3bc886c1c6/Tables/target1"  # Replace with your actual Delta path
+delta_table = DeltaTable.forPath(spark, delta_table_path)
+df_target = delta_table.toDF()
+
+# Join source and target
+join_cond = [df_source_latest[k] == df_target[k] for k in primary_keys]
+df_joined = df_source_latest.alias("src").join(df_target.alias("tgt"), join_cond, "left")
+
+# Identify new or changed records
+src_cols = [f"src.{c}" for c in compare_columns]
+tgt_cols = [f"tgt.{c}" for c in compare_columns]
+
+df_changed = df_joined.filter(
+    (F.xxhash64(*[col(c) for c in src_cols]) != F.xxhash64(*[col(c) for c in tgt_cols])) |
+    (col(f"tgt.{primary_keys[0]}").isNull())
+).select("src.*")
+
+# Deactivate matching records in target (if active)
+if not df_changed.rdd.isEmpty():
+    merge_condition = " AND ".join([f"tgt.{k} = src.{k}" for k in primary_keys])
+    delta_table.alias("tgt").merge(
+        df_changed.alias("src"),
+        merge_condition
+    ).whenMatchedUpdate(
+        condition="tgt.active_flag = 1",
+        set={
+            "active_flag": lit(0).cast("int"),
+            "isdeleted": lit(False)
+        }
+    ).execute()
+
+# Insert new records with active_flag = 1 and isdeleted = false
+df_to_insert = (
+    df_changed
+    .withColumn("active_flag", lit(1).cast(IntegerType()))
+    .withColumn("isdeleted", lit(False).cast(BooleanType()))
+)
+df_to_insert.write.format("delta").mode("append").save(delta_table_path)
+
+# Handle rows present in target but missing in source — mark as deleted
+df_not_in_source = df_target.alias("tgt") \
+    .join(df_source_latest.alias("src"), on=primary_keys, how="left_anti") \
+    .filter("tgt.active_flag = 1 AND tgt.isdeleted = false")
+
+if not df_not_in_source.rdd.isEmpty():
+    merge_condition = " AND ".join([f"tgt.{k} = src.{k}" for k in primary_keys])
+    delta_table.alias("tgt").merge(
+        df_not_in_source.alias("src"),
+        merge_condition
+    ).whenMatchedUpdate(
+        set={
+            "active_flag": lit(0).cast("int"),
+            "isdeleted": lit(True)
+        }
+    ).execute()
